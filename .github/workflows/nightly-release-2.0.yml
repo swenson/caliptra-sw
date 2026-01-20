@@ -3,7 +3,6 @@ name: Nightly Release 2.0
 on:
   # manual trigger only
   workflow_dispatch:
-  push:
 
 
 jobs:
