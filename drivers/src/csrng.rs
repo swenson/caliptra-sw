@@ -21,7 +21,8 @@ Abstract:
     (CSRNG) peripheral.
 
 --*/
-use crate::{wait, CaliptraError, CaliptraResult};
+use crate::persistent::EntropyConfiguration;
+use crate::{wait, CaliptraError, CaliptraResult, PersistentDataAccessor};
 use caliptra_registers::csrng::CsrngReg;
 use caliptra_registers::entropy_src::{self, regs::AlertFailCountsReadVal, EntropySrcReg};
 use caliptra_registers::soc_ifc::{self, SocIfcReg};
@@ -54,8 +55,15 @@ impl Csrng {
         csrng: CsrngReg,
         entropy_src: EntropySrcReg,
         soc_ifc: &SocIfcReg,
+        persistent_data: PersistentDataAccessor,
     ) -> CaliptraResult<Self> {
-        Self::with_seed(csrng, entropy_src, soc_ifc, Seed::EntropySrc)
+        Self::with_seed(
+            csrng,
+            entropy_src,
+            soc_ifc,
+            Seed::EntropySrc,
+            persistent_data,
+        )
     }
 
     /// # Safety
@@ -80,6 +88,7 @@ impl Csrng {
         entropy_src: EntropySrcReg,
         soc_ifc: &SocIfcReg,
         seed: Seed,
+        persistent_data: PersistentDataAccessor,
     ) -> CaliptraResult<Self> {
         const FALSE: u32 = MultiBitBool::False as u32;
         const TRUE: u32 = MultiBitBool::True as u32;
@@ -91,14 +100,21 @@ impl Csrng {
         // If already enabled, assume it was configured correctly by a previous call.
         if e.module_enable().read().module_enable() == FALSE {
             // Configure entropy_src
-            set_health_check_thresholds(e, soc_ifc.regs());
+            let entropy_cfg = read_entropy_configuration(&soc_ifc.regs(), persistent_data);
+            set_health_check_thresholds(e, entropy_cfg);
 
             e.conf().write(|w| {
                 w.fips_enable(TRUE)
                     .entropy_data_reg_enable(FALSE)
-                    .threshold_scope(TRUE)
+                    .threshold_scope(FALSE) // check thresholds invdividuslly rather than summing them
                     .rng_bit_enable(FALSE)
             });
+
+            // We allow the SoC to set bypass mode so that entropy can be
+            // characterized directly, without passing through conditioning.
+            if (soc_ifc.regs().ss_strap_generic().at(2).read() >> 31) & 1 == 1 {
+                e.entropy_control().modify(|w| w.es_type(TRUE));
+            }
             e.module_enable().write(|w| w.module_enable(TRUE));
             check_for_alert_state(result.entropy_src.regs())?;
 
@@ -121,8 +137,16 @@ impl Csrng {
                 .write(|w| w.enable(TRUE).sw_app_enable(TRUE).read_int_state(TRUE));
         }
 
-        send_command(&mut result.csrng, Command::Uninstantiate)?;
-        send_command(&mut result.csrng, Command::Instantiate(seed))?;
+        send_command(
+            &mut result.csrng,
+            &result.entropy_src,
+            Command::Uninstantiate,
+        )?;
+        send_command(
+            &mut result.csrng,
+            &result.entropy_src,
+            Command::Instantiate(seed),
+        )?;
 
         Ok(result)
     }
@@ -149,6 +173,7 @@ impl Csrng {
 
         send_command(
             &mut self.csrng,
+            &self.entropy_src,
             Command::Generate {
                 num_128_bit_blocks: 12 / WORDS_PER_BLOCK,
             },
@@ -177,13 +202,13 @@ impl Csrng {
     }
 
     pub fn reseed(&mut self, seed: Seed) -> CaliptraResult<()> {
-        send_command(&mut self.csrng, Command::Reseed(seed))
+        send_command(&mut self.csrng, &self.entropy_src, Command::Reseed(seed))
     }
 
     pub fn update(&mut self, additional_data: &[u32]) -> CaliptraResult<()> {
         // if we are given too much data, do multiple updates
         for data in additional_data.chunks(MAX_SEED_WORDS) {
-            send_command(&mut self.csrng, Command::Update(data))?;
+            send_command(&mut self.csrng, &self.entropy_src, Command::Update(data))?;
         }
         Ok(())
     }
@@ -199,7 +224,7 @@ impl Csrng {
     }
 
     pub fn uninstantiate(mut self) {
-        let _ = send_command(&mut self.csrng, Command::Uninstantiate);
+        let _ = send_command(&mut self.csrng, &self.entropy_src, Command::Uninstantiate);
     }
 }
 
@@ -217,7 +242,7 @@ fn check_for_alert_state(
             ALERT_HANG => {
                 let alert_counts = entropy_src.alert_fail_counts().read();
 
-                if alert_counts.repcnt_fail_count() > 0 {
+                if alert_counts.repcnt_fail_count() > 0 || alert_counts.repcnts_fail_count() > 0 {
                     return Err(CaliptraError::DRIVER_CSRNG_REPCNT_HEALTH_CHECK_FAILED);
                 }
 
@@ -276,7 +301,11 @@ pub struct HealthFailCounts {
     pub specific: AlertFailCountsReadVal,
 }
 
-fn send_command(csrng: &mut CsrngReg, command: Command) -> CaliptraResult<()> {
+fn send_command(
+    csrng: &mut CsrngReg,
+    entropy_src: &EntropySrcReg,
+    command: Command,
+) -> CaliptraResult<()> {
     // https://opentitan.org/book/hw/ip/csrng/doc/theory_of_operation.html#general-command-format
     let acmd: u32;
     let clen: usize;
@@ -364,6 +393,11 @@ fn send_command(csrng: &mut CsrngReg, command: Command) -> CaliptraResult<()> {
             return Err(err);
         }
 
+        // if we are generating data, then check if the entropy_src had an error
+        if matches!(command, Command::Generate { .. }) {
+            check_for_alert_state(entropy_src.regs())?;
+        }
+
         // TODO: if the hardware is fixed to make the ack flag sticky, we should
         // check that as well before exiting the loop.
         if reg.cmd_rdy() {
@@ -372,76 +406,143 @@ fn send_command(csrng: &mut CsrngReg, command: Command) -> CaliptraResult<()> {
     }
 }
 
+fn read_entropy_configuration(
+    soc_ifc: &soc_ifc::RegisterBlock<ureg::RealMmio>,
+    mut persistent_data: PersistentDataAccessor,
+) -> EntropyConfiguration {
+    // Some of the entropy config registers are not lockable,
+    // so we keep them in persistent storage so that they cannot
+    // be maliciously later.
+    let entropy_cfg = persistent_data.get_mut().rom.entropy_cfg.clone();
+    if entropy_cfg.configured != 0 {
+        return entropy_cfg;
+    }
+
+    // Configure alert threshold from CPTRA_ITRNG_ENTROPY_CONFIG_1[31:16]
+    // Default alert threshold value
+    const DEFAULT_ALERT_THRESHOLD: u32 = 2;
+
+    let alert_thresh = soc_ifc.cptra_i_trng_entropy_config_1().read().rsvd();
+
+    let alert_threshold = if alert_thresh == 0 {
+        DEFAULT_ALERT_THRESHOLD
+    } else {
+        alert_thresh
+    };
+
+    // Configure health test windows from SS_STRAP_GENERIC[2][15:0]
+    // This is the window size for all health tests.
+    // This value is used when entropy is being tested in FIPS mode.
+    // The default value is (2048 bits * 1 clock/4 bits);
+    const DEFAULT_HEALTH_TEST_WINDOW: u32 = 512;
+
+    let health_test_window = soc_ifc.ss_strap_generic().at(2).read() & 0xffff;
+
+    let health_test_window = if health_test_window == 0 {
+        DEFAULT_HEALTH_TEST_WINDOW
+    } else {
+        health_test_window
+    };
+
+    // Configure Repetition Count Test threshold
+
+    // The Repetition Count test fails if:
+    //  * An RNG wire repeats the same bit THRESHOLD times in a row.
+    // See section 4.4.1 of NIST.SP.800-90B for more information of about this test.
+
+    // If the SOC doesn't specify a repcnt threshold, use this default, which assumes a min-entropy of 1.
+    const DEFAULT_REPCNT_THRESHOLD: u32 = 41;
+
+    let repcnt_threshold = soc_ifc
+        .cptra_i_trng_entropy_config_1()
+        .read()
+        .repetition_count();
+
+    let repcnt_threshold = if repcnt_threshold == 0 {
+        DEFAULT_REPCNT_THRESHOLD
+    } else {
+        repcnt_threshold
+    };
+
+    // The Adaptive Proportion test fails if:
+    //  * Any window has more than the HI threshold of 1's; or,
+    //  * Any window has less than the LO threshold of 1's.
+    // See section 4.4.2 of NIST.SP.800-90B for more information of about this test.
+
+    // If soc doesn't set the window size, then use these defaults.
+    // Use 75% and 25% of the 2048 bit FIPS window size for the default HI and LO thresholds
+    // respectively.
+    //
+    // This window value of 2048 comes from the OpenTitan documentation, since two noise
+    // channels are used. https://opentitan.org/book/hw/ip/entropy_src/index.html#description
+    const ADAPTP_WINDOW_SIZE_BITS: u32 = 2048;
+    const ADAPTP_DEFAULT_HI: u32 = 3 * (ADAPTP_WINDOW_SIZE_BITS / 4);
+    const ADAPTP_DEFAULT_LO: u32 = ADAPTP_WINDOW_SIZE_BITS / 4;
+
+    // TODO: What to do if HI <= LO?
+    let adaptp_hi_threshold = soc_ifc
+        .cptra_i_trng_entropy_config_0()
+        .read()
+        .high_threshold();
+
+    let adaptp_lo_threshold = soc_ifc
+        .cptra_i_trng_entropy_config_0()
+        .read()
+        .low_threshold();
+
+    let adaptp_hi_threshold = if adaptp_hi_threshold == 0 {
+        ADAPTP_DEFAULT_HI
+    } else {
+        adaptp_hi_threshold
+    };
+
+    let adaptp_lo_threshold = if adaptp_lo_threshold == 0 {
+        ADAPTP_DEFAULT_LO
+    } else {
+        adaptp_lo_threshold
+    };
+
+    let entropy_cfg = EntropyConfiguration {
+        configured: 0xffff_ffff,
+        alert_threshold,
+        health_test_window,
+        repcnt_threshold,
+        adaptp_hi_threshold,
+        adaptp_lo_threshold,
+    };
+    // save for later resets
+    persistent_data.get_mut().rom.entropy_cfg = entropy_cfg.clone();
+    entropy_cfg
+}
+
+/// Configure thresholds for the NIST health checks.
 fn set_health_check_thresholds(
     e: entropy_src::RegisterBlock<ureg::RealMmioMut>,
-    soc_ifc: soc_ifc::RegisterBlock<ureg::RealMmio>,
+    entropy_cfg: EntropyConfiguration,
 ) {
-    // Configure thresholds for the two approved NIST health checks:
-    //  1. Repetition Count Test
-    //  2. Adaptive Proportion Test
+    // configure the alert threshold and its inverse as required
+    e.alert_threshold().write(|w| {
+        w.alert_threshold(entropy_cfg.alert_threshold)
+            .alert_threshold_inv((!entropy_cfg.alert_threshold) & 0xffff)
+    });
 
-    {
-        // The Repetition Count test fails if:
-        //  * An RNG wire repeats the same bit THRESHOLD times in a row.
-        // See section 4.4.1 of NIST.SP.800-90B for more information of about this test.
+    // don't modify bypass window
+    e.health_test_windows()
+        .modify(|w| w.fips_window(entropy_cfg.health_test_window));
 
-        // If the SOC doesn't specify a threshold, use this default, which assumes a min-entropy of 1.
-        const DEFAULT_THRESHOLD: u32 = 41;
+    // don't modify bypass threshold
+    e.repcnt_thresholds()
+        .modify(|w| w.fips_thresh(entropy_cfg.repcnt_threshold));
 
-        let threshold = soc_ifc
-            .cptra_i_trng_entropy_config_1()
-            .read()
-            .repetition_count();
+    // don't modify bypass threshold
+    e.repcnts_thresholds()
+        .modify(|w| w.fips_thresh(entropy_cfg.repcnt_threshold));
 
-        e.repcnt_thresholds().write(|w| {
-            w.fips_thresh(if threshold == 0 {
-                DEFAULT_THRESHOLD
-            } else {
-                threshold
-            })
-        });
-    }
+    // don't modify bypass threshold
+    e.adaptp_hi_thresholds()
+        .modify(|w| w.fips_thresh(entropy_cfg.adaptp_hi_threshold));
 
-    {
-        // The Adaptive Proportion test fails if:
-        //  * Any window has more than the HI threshold of 1's; or,
-        //  * Any window has less than the LO threshold of 1's.
-        // See section 4.4.2 of NIST.SP.800-90B for more information of about this test.
-
-        // Use 75% and 25% of the 2048 bit FIPS window size for the default HI and LO thresholds
-        // respectively.
-        //
-        // This window value of 2048 comes from the OpenTitan documentation, since two noise
-        // channels are used. https://opentitan.org/book/hw/ip/entropy_src/index.html#description
-        const WINDOW_SIZE_BITS: u32 = 2048;
-        const DEFAULT_HI: u32 = 3 * (WINDOW_SIZE_BITS / 4);
-        const DEFAULT_LO: u32 = WINDOW_SIZE_BITS / 4;
-
-        // TODO: What to do if HI <= LO?
-        let threshold_hi = soc_ifc
-            .cptra_i_trng_entropy_config_0()
-            .read()
-            .high_threshold();
-
-        let threshold_lo = soc_ifc
-            .cptra_i_trng_entropy_config_0()
-            .read()
-            .low_threshold();
-
-        e.adaptp_hi_thresholds().write(|w| {
-            w.fips_thresh(if threshold_hi == 0 {
-                DEFAULT_HI
-            } else {
-                threshold_hi
-            })
-        });
-
-        e.adaptp_lo_thresholds().write(|w| {
-            w.fips_thresh(if threshold_lo == 0 {
-                DEFAULT_LO
-            } else {
-                threshold_lo
-            })
-        });
-    }
+    // don't modify bypass threshold
+    e.adaptp_lo_thresholds()
+        .modify(|w| w.fips_thresh(entropy_cfg.adaptp_lo_threshold));
 }

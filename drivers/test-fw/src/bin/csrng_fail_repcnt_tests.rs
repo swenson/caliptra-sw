@@ -17,7 +17,7 @@ Abstract:
 #![no_std]
 #![no_main]
 
-use caliptra_drivers::Csrng;
+use caliptra_drivers::{Csrng, PersistentDataAccessor};
 use caliptra_error::CaliptraError;
 use caliptra_registers::{csrng::CsrngReg, entropy_src::EntropySrcReg, soc_ifc::SocIfcReg};
 use caliptra_test_harness::test_suite;
@@ -26,7 +26,8 @@ fn test_boot_fail_repcnt_check() {
     let csrng_reg = unsafe { CsrngReg::new() };
     let entropy_src_reg = unsafe { EntropySrcReg::new() };
     let soc_ifc_reg = unsafe { SocIfcReg::new() };
-    let csrng = Csrng::new(csrng_reg, entropy_src_reg, &soc_ifc_reg);
+    let persistent_data = unsafe { PersistentDataAccessor::new() };
+    let csrng = Csrng::new(csrng_reg, entropy_src_reg, &soc_ifc_reg, persistent_data);
 
     if let Err(e) = csrng {
         assert_eq!(

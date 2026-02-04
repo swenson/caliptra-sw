@@ -69,11 +69,17 @@ pub struct Csrng {
     #[register(offset = 0x1034, write_fn = repcnt_thresholds_write)]
     repcnt_thresholds: u32,
 
+    #[register(offset = 0x1038)]
+    _repcnts_thresholds: u32, // TODO: implement this test using symbols
+
     #[register(offset = 0x103c, write_fn = adaptp_hi_thresholds_write)]
     adaptp_hi_thresholds: u32,
 
     #[register(offset = 0x1040, write_fn = adaptp_lo_thresholds_write)]
     adaptp_lo_thresholds: u32,
+
+    #[register(offset = 0x10a0)]
+    alert_thresholds: u32, // TODO: implement this
 
     #[register(offset = 0x10a4, read_fn = alert_summary_fail_counts_read)]
     alert_summary_fail_counts: ReadOnlyRegister<u32>,
@@ -108,8 +114,10 @@ impl Csrng {
             conf: 0x909099,
             health_test_windows: ReadOnlyRegister::new(0x600200),
             repcnt_thresholds: 0xffffffff,
+            _repcnts_thresholds: 0xffffffff,
             adaptp_hi_thresholds: 0xffffffff,
             adaptp_lo_thresholds: 0,
+            alert_thresholds: 2,
             alert_summary_fail_counts: ReadOnlyRegister::new(0),
             alert_fail_counts: ReadOnlyRegister::new(0),
             main_sm_state: ReadOnlyRegister::new(0x2c), // StartupHTStart, entropy_src_main_sm_pkg.sv
