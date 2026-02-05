@@ -1074,6 +1074,36 @@ fn test_csrng_adaptive_proportion() {
     test_with_soc_threshold(FAIL, include_bytes!("test_data/csrng/1225_ones_823_zeros"));
 }
 
+/// Test the Repetition Count Symbol (repcnts) health check.
+/// Unlike the per-wire repcnt test, repcnts checks if the entire 4-bit symbol repeats.
+#[test]
+#[cfg_attr(
+    all(
+        any(
+            feature = "verilator",
+            feature = "fpga_realtime",
+            feature = "fpga_subsystem"
+        ),
+        not(feature = "itrng")
+    ),
+    ignore
+)]
+fn test_csrng_repcnts() {
+    // Test that repeating nibble symbols fail the repcnts health check.
+    // A stream of alternating 0x5 and 0xA nibbles passes (nibbles don't repeat),
+    // but a stream of constant nibbles fails because the symbol repeats.
+
+    const FAIL: &FwId = &firmware::driver_tests::CSRNG_FAIL_REPCNTS_TESTS;
+
+    // Constant nibble stream: 0x7, 0x7, 0x7, ...
+    // This will fail both repcnt (individual wires repeat) and repcnts (symbol repeats).
+    // The driver returns DRIVER_CSRNG_REPCNT_HEALTH_CHECK_FAILED for both.
+    test_csrng_with_nibbles(FAIL, Box::new(iter::repeat(0b0111)));
+
+    // Different constant value to verify it's not value-specific
+    test_csrng_with_nibbles(FAIL, Box::new(iter::repeat(0b1010)));
+}
+
 /// Test that entropy_src configuration registers are locked in production mode (debug_locked=true).
 /// After CSRNG initialization, SW_REGUPD should be cleared to prevent
 /// RT firmware from reconfiguring entropy_src.
@@ -1102,6 +1132,57 @@ fn test_csrng_config_locked_in_production() {
             security_state: *SecurityState::from(0)
                 .set_debug_locked(true)
                 .set_device_lifecycle(DeviceLifecycle::Production),
+            ..default_init_params()
+        },
+        BootParams::default(),
+    )
+    .unwrap();
+
+    model.step_until_exit_success().unwrap();
+}
+
+/// Test that entropy_src health check failures during runtime (after boot passes) are detected.
+/// This verifies that the CSRNG properly detects low-entropy scenarios where the entropy source
+/// initially appears healthy but degrades during operation.
+#[test]
+#[cfg_attr(
+    all(
+        any(
+            feature = "verilator",
+            feature = "fpga_realtime",
+            feature = "fpga_subsystem"
+        ),
+        not(feature = "itrng")
+    ),
+    ignore
+)]
+fn test_csrng_runtime_health_failure() {
+    let rom = caliptra_builder::build_firmware_rom(
+        &firmware::driver_tests::CSRNG_RUNTIME_HEALTH_FAIL_TESTS,
+    )
+    .unwrap();
+
+    // Provide just enough good entropy for boot health testing (two 2048-bit windows),
+    // then switch to bad entropy. The bad entropy (stuck at all 1s) will cause
+    // the repetition count test to fail during subsequent generate operations.
+    //
+    // Boot health testing: 2 windows × 512 nibbles = 1024 nibbles
+    // These nibbles are stored and re-used during instantiate.
+    // During generate, once stored nibbles are exhausted, bad entropy kicks in.
+    const BOOT_WINDOW_NIBBLES: usize = 2048 / 4; // 512 nibbles per window
+    const BOOT_NIBBLES: usize = BOOT_WINDOW_NIBBLES * 2; // Two windows for boot
+
+    let itrng_nibbles = Box::new(
+        trng_nibbles()
+            .take(BOOT_NIBBLES)
+            .chain(iter::repeat(0b1111)), // Stuck at all 1s - will fail repcnt
+    );
+
+    let mut model = caliptra_hw_model::new(
+        InitParams {
+            rom: &rom,
+            itrng_nibbles,
+            trng_mode: Some(TrngMode::Internal),
             ..default_init_params()
         },
         BootParams::default(),
@@ -1144,6 +1225,52 @@ fn test_csrng_config_unlocked_in_debug() {
     )
     .unwrap();
 
+    model.step_until_exit_success().unwrap();
+}
+
+/// Test that entropy configuration stored during cold boot is preserved across warm reset,
+/// even if registers are maliciously modified during runtime.
+#[test]
+#[cfg_attr(
+    all(
+        any(
+            feature = "verilator",
+            feature = "fpga_realtime",
+            feature = "fpga_subsystem"
+        ),
+        not(feature = "itrng")
+    ),
+    ignore
+)]
+fn test_csrng_entropy_config_warm_reset() {
+    // Magic boot status that the test firmware writes to signal ready for warm reset
+    const WARM_RESET_READY_BOOT_STATUS: u32 = 0xCAFE_1234;
+
+    let rom = caliptra_builder::build_firmware_rom(
+        &firmware::driver_tests::CSRNG_ENTROPY_CONFIG_WARM_RESET_TESTS,
+    )
+    .unwrap();
+
+    let mut model = caliptra_hw_model::new(
+        InitParams {
+            rom: &rom,
+            itrng_nibbles: Box::new(trng_nibbles()),
+            trng_mode: Some(TrngMode::Internal),
+            ..default_init_params()
+        },
+        BootParams::default(),
+    )
+    .unwrap();
+
+    // Cold reset: test firmware initializes CSRNG, writes bad values to registers,
+    // then signals for warm reset
+    model.step_until_boot_status(WARM_RESET_READY_BOOT_STATUS, true);
+
+    // Perform warm reset
+    model.warm_reset_flow().unwrap();
+
+    // Warm reset: test firmware verifies CSRNG initializes successfully
+    // (using stored config, not bad register values)
     model.step_until_exit_success().unwrap();
 }
 
