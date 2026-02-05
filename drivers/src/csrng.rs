@@ -421,12 +421,12 @@ fn read_entropy_configuration(
     // Default alert threshold value
     const DEFAULT_ALERT_THRESHOLD: u32 = 2;
 
-    let alert_thresh = soc_ifc.cptra_i_trng_entropy_config_1().read().rsvd();
+    let alert_threshold = soc_ifc.cptra_i_trng_entropy_config_1().read().rsvd();
 
-    let alert_threshold = if alert_thresh == 0 {
+    let alert_threshold = if alert_threshold == 0 {
         DEFAULT_ALERT_THRESHOLD
     } else {
-        alert_thresh
+        alert_threshold
     };
 
     // Configure health test windows from SS_STRAP_GENERIC[2][15:0]
@@ -525,23 +525,18 @@ fn set_health_check_thresholds(
             .alert_threshold_inv((!entropy_cfg.alert_threshold) & 0xffff)
     });
 
-    // don't modify bypass window
     e.health_test_windows()
-        .modify(|w| w.fips_window(entropy_cfg.health_test_window));
+        .write(|w| w.fips_window(entropy_cfg.health_test_window));
 
-    // don't modify bypass threshold
     e.repcnt_thresholds()
-        .modify(|w| w.fips_thresh(entropy_cfg.repcnt_threshold));
+        .write(|w| w.fips_thresh(entropy_cfg.repcnt_threshold));
 
-    // don't modify bypass threshold
     e.repcnts_thresholds()
-        .modify(|w| w.fips_thresh(entropy_cfg.repcnt_threshold));
+        .write(|w| w.fips_thresh(entropy_cfg.repcnt_threshold));
 
-    // don't modify bypass threshold
     e.adaptp_hi_thresholds()
-        .modify(|w| w.fips_thresh(entropy_cfg.adaptp_hi_threshold));
+        .write(|w| w.fips_thresh(entropy_cfg.adaptp_hi_threshold));
 
-    // don't modify bypass threshold
     e.adaptp_lo_thresholds()
-        .modify(|w| w.fips_thresh(entropy_cfg.adaptp_lo_threshold));
+        .write(|w| w.fips_thresh(entropy_cfg.adaptp_lo_threshold));
 }
