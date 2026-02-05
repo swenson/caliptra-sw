@@ -106,7 +106,7 @@ impl Csrng {
             e.conf().write(|w| {
                 w.fips_enable(TRUE)
                     .entropy_data_reg_enable(FALSE)
-                    .threshold_scope(FALSE) // check thresholds invdividuslly rather than summing them
+                    .threshold_scope(TRUE)
                     .rng_bit_enable(FALSE)
             });
 
@@ -121,12 +121,11 @@ impl Csrng {
             // Lock entropy_src configuration if not in debug mode.
             // Per security model: ROM programs once, then locks permanently.
             // - SW_REGUPD: When cleared, configuration registers become read-only
-            // - ME_REGWEN: When cleared, MODULE_ENABLE becomes read-only
             // In debug mode (debug_locked == false), leave unlocked for characterization.
+            // We leave the module enable able to be turned off for potential power savings in runtime.
             if soc_ifc.regs().cptra_security_state().read().debug_locked() {
                 let e = result.entropy_src.regs_mut();
-                e.sw_regupd().write(|w| w.sw_regupd(false));
-                e.me_regwen().write(|w| w.me_regwen(false));
+                e.sw_regupd().modify(|w| w.sw_regupd(false));
             }
         }
 

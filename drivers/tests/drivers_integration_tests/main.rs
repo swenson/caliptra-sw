@@ -1075,7 +1075,7 @@ fn test_csrng_adaptive_proportion() {
 }
 
 /// Test that entropy_src configuration registers are locked in production mode (debug_locked=true).
-/// After CSRNG initialization, SW_REGUPD and ME_REGWEN should be cleared to prevent
+/// After CSRNG initialization, SW_REGUPD should be cleared to prevent
 /// RT firmware from reconfiguring entropy_src.
 #[test]
 #[cfg_attr(
@@ -1308,7 +1308,7 @@ fn test_ocp_lock() {
 
     if !model.supports_ocp_lock() {
         // We add this assert to make sure this test doesn't fail open.
-        assert_eq!(cfg!(feature = "ocp-lock"), model.supports_ocp_lock(), 
+        assert_eq!(cfg!(feature = "ocp-lock"), model.supports_ocp_lock(),
             "The OCP LOCK feature is enabled but the HW does not support it. Is there a misconfiguration?");
         return;
     }
