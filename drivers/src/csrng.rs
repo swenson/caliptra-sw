@@ -22,7 +22,7 @@ Abstract:
 
 --*/
 use crate::persistent::EntropyConfiguration;
-use crate::{wait, CaliptraError, CaliptraResult, PersistentDataAccessor};
+use crate::{cprintln, wait, CaliptraError, CaliptraResult, PersistentDataAccessor};
 use caliptra_registers::csrng::CsrngReg;
 use caliptra_registers::entropy_src::{self, regs::AlertFailCountsReadVal, EntropySrcReg};
 use caliptra_registers::soc_ifc::{self, SocIfcReg};
@@ -519,6 +519,14 @@ fn set_health_check_thresholds(
     e: entropy_src::RegisterBlock<ureg::RealMmioMut>,
     entropy_cfg: EntropyConfiguration,
 ) {
+    cprintln!(
+        "[csrng] Setting entropy config to {} {} {} {} {}",
+        entropy_cfg.alert_threshold,
+        entropy_cfg.health_test_window,
+        entropy_cfg.repcnt_threshold,
+        entropy_cfg.adaptp_hi_threshold,
+        entropy_cfg.adaptp_lo_threshold
+    );
     // configure the alert threshold and its inverse as required
     e.alert_threshold().write(|w| {
         w.alert_threshold(entropy_cfg.alert_threshold)
