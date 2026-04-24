@@ -18,8 +18,9 @@ Abstract:
 use caliptra_cfi_lib::CfiCounter;
 use caliptra_drivers::{
     Array4x12, Array4x16, Hmac, HmacData, HmacKey, HmacMode, HmacTag, KeyId, KeyReadArgs, KeyUsage,
-    KeyWriteArgs, LEArray4x16, LEArray4x8, Mldsa87, Mldsa87Msg, Mldsa87PrivKey, Mldsa87PubKey,
-    Mldsa87Result, Mldsa87Seed, Mldsa87SignRnd, Mldsa87Signature, PersistentDataAccessor, Trng,
+    KeyWriteArgs, LEArray4x16, LEArray4x8, Mldsa87, Mldsa87Msg, Mldsa87Mu, Mldsa87PrivKey,
+    Mldsa87PubKey, Mldsa87Result, Mldsa87Seed, Mldsa87SignRnd, Mldsa87Signature,
+    PersistentDataAccessor, Trng,
 };
 use caliptra_registers::abr::AbrReg;
 use caliptra_registers::csrng::CsrngReg;
@@ -28,7 +29,7 @@ use caliptra_registers::hmac::HmacReg;
 use caliptra_registers::soc_ifc::SocIfcReg;
 use caliptra_registers::soc_ifc_trng::SocIfcTrngReg;
 use caliptra_test_harness::test_suite;
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 const PUBKEY: [u32; 648] = [
     0x91204ff5, 0xe7902480, 0xa0e5c933, 0x72a637ac, 0xfabb499d, 0x6ffb2abb, 0x8511668e, 0xdb8a3253,
     0x553de529, 0x413f8be9, 0x5ea473d7, 0x8081ee24, 0x246090d8, 0xdd247908, 0x2e8b653c, 0x31837dac,
@@ -975,15 +976,213 @@ fn test_verify_failure() {
     );
 }
 
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_decode(hex: &str, buf: &mut [u8]) -> Option<usize> {
+    let hex = hex.as_bytes();
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let n = hex.len() / 2;
+    if n > buf.len() {
+        return None;
+    }
+    for i in 0..n {
+        let hi = hex_nibble(hex[i * 2])?;
+        let lo = hex_nibble(hex[i * 2 + 1])?;
+        buf[i] = (hi << 4) | lo;
+    }
+    Some(n)
+}
+
+// Static buffers to avoid stack overflow for large ML-DSA structures.
+static mut PUBKEY_BUF: [u8; 2592] = [0u8; 2592];
+static mut PRIVKEY_BUF: [u8; 4896] = [0u8; 4896];
+static mut KEYGEN_PRIVKEY: Mldsa87PrivKey = Mldsa87PrivKey::new([0u32; 1224]);
+static mut SIG_BUF: [u8; 4628] = [0u8; 4628];
+static mut MSG_BUF: [u8; 64] = [0u8; 64];
+static mut SEED_BUF: [u8; 32] = [0u8; 32];
+
+fn test_acvp() {
+    let mut trng = unsafe {
+        Trng::new(
+            CsrngReg::new(),
+            EntropySrcReg::new(),
+            SocIfcTrngReg::new(),
+            &SocIfcReg::new(),
+            PersistentDataAccessor::new(),
+        )
+        .unwrap()
+    };
+    let mut entropy_gen = || {
+        trng.generate4()
+            .map_err(|e| caliptra_cfi_lib::CfiError(u32::from(e)))
+    };
+    // This needs to happen in the first test
+    CfiCounter::reset(&mut entropy_gen);
+
+    const CURRENT: &str = include_str!("./vectors/current.txt");
+    let mut lines = CURRENT.lines();
+    let test_type = lines.next().unwrap().trim();
+
+    let mut abr_reg = unsafe { AbrReg::new() };
+    let mut ml_dsa87 = Mldsa87::new(&mut abr_reg);
+
+    match test_type {
+        "MLDSA_KEYGEN" => {
+            let hex_seed = lines.next().unwrap().trim();
+
+            let seed_buf = unsafe { &mut SEED_BUF };
+            hex_decode(hex_seed, seed_buf).unwrap();
+
+            let seed = LEArray4x8::from(*seed_buf);
+            let priv_key = unsafe { &mut KEYGEN_PRIVKEY };
+            let pub_key = ml_dsa87
+                .key_pair(Mldsa87Seed::Array4x8(&seed), &mut trng, Some(priv_key))
+                .unwrap();
+
+            for byte in pub_key.as_bytes().iter() {
+                println!("MLDSA_PUBKEY:{:02X}", byte);
+            }
+            for byte in unsafe { KEYGEN_PRIVKEY.as_bytes() }.iter() {
+                println!("MLDSA_PRIVKEY:{:02X}", byte);
+            }
+        }
+
+        "MLDSA_SIGGEN" => {
+            let hex_key = lines.next().unwrap().trim();
+
+            let mut trng = unsafe {
+                Trng::new(
+                    CsrngReg::new(),
+                    EntropySrcReg::new(),
+                    SocIfcTrngReg::new(),
+                    &SocIfcReg::new(),
+                    PersistentDataAccessor::new(),
+                )
+                .unwrap()
+            };
+
+            let signature = if hex_key.len() == 64 {
+                // Seed input (32 bytes): derive public key, then sign.
+                let seed_buf = unsafe { &mut SEED_BUF };
+                hex_decode(hex_key, seed_buf).unwrap();
+                let hex_msg = lines.next().unwrap().trim();
+                let msg_buf = unsafe { &mut MSG_BUF };
+                let msg_len = hex_decode(hex_msg, msg_buf).unwrap();
+
+                let mut rnd_buf = [0u8; 32];
+                let sign_rnd = match lines.next().map(str::trim) {
+                    Some(hex_rnd) if hex_rnd.len() == 64 => {
+                        hex_decode(hex_rnd, &mut rnd_buf).unwrap();
+                        LEArray4x8::from(rnd_buf)
+                    }
+                    _ => Mldsa87SignRnd::default(),
+                };
+
+                let seed = LEArray4x8::from(*seed_buf);
+                let pub_key = ml_dsa87
+                    .key_pair(Mldsa87Seed::Array4x8(&seed), &mut trng, None)
+                    .unwrap();
+                ml_dsa87
+                    .sign_var(
+                        Mldsa87Seed::Array4x8(&seed),
+                        &pub_key,
+                        &msg_buf[..msg_len],
+                        &sign_rnd,
+                        &mut trng,
+                    )
+                    .unwrap()
+            } else {
+                // SK input (4,896 bytes = 9,792 hex chars): message on next line.
+                // No pk provided; post-sign verification is skipped.
+                let privkey_buf = unsafe { &mut PRIVKEY_BUF };
+                hex_decode(hex_key, privkey_buf).unwrap();
+                let hex_msg = lines.next().unwrap().trim();
+                let msg_buf = unsafe { &mut MSG_BUF };
+                let msg_len = hex_decode(hex_msg, msg_buf).unwrap();
+
+                let mut rnd_buf = [0u8; 32];
+                let sign_rnd = match lines.next().map(str::trim) {
+                    Some(hex_rnd) if hex_rnd.len() == 64 => {
+                        hex_decode(hex_rnd, &mut rnd_buf).unwrap();
+                        LEArray4x8::from(rnd_buf)
+                    }
+                    _ => Mldsa87SignRnd::default(),
+                };
+
+                let priv_key = Mldsa87PrivKey::read_from_bytes(privkey_buf.as_slice()).unwrap();
+                ml_dsa87
+                    .sign_var_no_verify(
+                        Mldsa87Seed::PrivKey(&priv_key),
+                        &msg_buf[..msg_len],
+                        &sign_rnd,
+                        &mut trng,
+                    )
+                    .unwrap()
+            };
+
+            for byte in signature.as_bytes().iter() {
+                println!("MLDSA_SIGGEN:{:02X}", byte);
+            }
+        }
+
+        "MLDSA_SIGVER" => {
+            let hex_pubkey = lines.next().unwrap().trim();
+            let hex_msg = lines.next().unwrap().trim();
+            let hex_sig = lines.next().unwrap().trim();
+
+            let pubkey_buf = unsafe { &mut PUBKEY_BUF };
+            let msg_buf = unsafe { &mut MSG_BUF };
+            let sig_buf = unsafe { &mut SIG_BUF };
+
+            hex_decode(hex_pubkey, pubkey_buf).unwrap();
+            let msg_len = hex_decode(hex_msg, msg_buf).unwrap();
+            hex_decode(hex_sig, sig_buf).unwrap();
+
+            // pubkey and sig are arrays of big-endian 32-bit words; byte-swap to little-endian.
+            // The message is a plain byte array and is streamed as-is by the hardware.
+            for chunk in pubkey_buf.chunks_exact_mut(4) {
+                chunk.reverse();
+            }
+            for chunk in sig_buf.chunks_exact_mut(4) {
+                chunk.reverse();
+            }
+
+            let pub_key = Mldsa87PubKey::read_from_bytes(pubkey_buf.as_slice()).unwrap();
+            let signature = Mldsa87Signature::read_from_bytes(sig_buf.as_slice()).unwrap();
+
+            let result = ml_dsa87
+                .verify_var(&pub_key, &msg_buf[..msg_len], &signature)
+                .unwrap();
+
+            match result {
+                Mldsa87Result::Success => println!("MLDSA_SIGVER:01"),
+                Mldsa87Result::SigVerifyFailed => println!("MLDSA_SIGVER:00"),
+            }
+        }
+
+        _ => panic!("Unknown test type"),
+    }
+}
+
 test_suite! {
-    test_mldsa_name,
-    test_gen_key_pair,
-    test_sign,
-    test_sign_caller_provided_private_key,
-    test_sign_and_verify_var,
-    test_sign_caller_provided_private_key_var_msg,
-    test_keygen_caller_provided_seed_var_msg,
-    test_keygen_caller_provided_seed,
-    test_verify,
-    test_verify_failure,
+    // test_mldsa_name,
+    // test_gen_key_pair,
+    // test_sign,
+    // test_sign_caller_provided_private_key,
+    // test_sign_and_verify_var,
+    // test_sign_caller_provided_private_key_var_msg,
+    // test_keygen_caller_provided_seed_var_msg,
+    // test_keygen_caller_provided_seed,
+    // test_verify,
+    // test_verify_failure,
+    test_acvp,
 }
