@@ -41,7 +41,7 @@ pub mod keys;
 pub mod lcc;
 pub mod mmio;
 mod model_emulated;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "platform-specific"))]
 // openocd uses Linux-specific syscalls (prctl PR_SET_PDEATHSIG via rustix) to
 // spawn the server process, so gate it to Linux rather than all unix.
 pub mod openocd;
