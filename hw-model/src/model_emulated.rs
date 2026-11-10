@@ -152,7 +152,7 @@ impl ModelEmulated {
     /// Snapshot of the Caliptra Key Vault (keys, PCRs, and control registers).
     /// Intended for inspection / debugging by external code such as the WASM demo UI.
     pub fn key_vault_snapshot(&self) -> caliptra_emu_periph::KeyVaultSnapshot {
-        self.cpu.bus.inner().bus.key_vault.snapshot()
+        self.cpu.bus.bus.key_vault.snapshot()
     }
 }
 
