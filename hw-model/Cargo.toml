@@ -8,18 +8,24 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = []
-verilator = ["dep:caliptra-verilated"]
-fpga_realtime = ["dep:uio"]
+default = ["profiling", "platform-specific"]
+verilator = ["dep:caliptra-verilated", "platform-specific"]
+fpga_realtime = ["dep:uio", "platform-specific"]
 itrng = ["caliptra-verilated?/itrng"]
 coverage = ["dep:caliptra-coverage"]
 "hw-1.0" = ["caliptra-emu-periph/hw-1.0"]
+# Stack sampling flamegraphs (InitParams::elfs, ModelEmulated::gen_flamegraph).
+# Needs host-only crates; disable for wasm32 builds.
+profiling = ["dep:caliptra-builder", "dep:inferno", "dep:rustc-demangle"]
+# Platform-specific deps (nix, libc) needed for FPGA models.
+# Disable for wasm32 builds.
+platform-specific = ["dep:nix", "dep:libc"]
 
 [dependencies]
 bitfield.workspace = true
 bit-vec.workspace = true
 caliptra-api-types.workspace = true
-caliptra-builder.workspace = true
+caliptra-builder = { workspace = true, optional = true }
 caliptra-emu-bus.workspace = true
 caliptra-emu-cpu.workspace = true
 caliptra-emu-periph.workspace = true
@@ -33,12 +39,12 @@ sha2.workspace = true
 uio = { workspace = true, optional = true }
 ureg.workspace = true
 zerocopy.workspace = true
-nix.workspace = true
-libc.workspace = true
+nix = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 caliptra-coverage = { workspace = true, optional = true }
 caliptra-image-types.workspace = true
-inferno = "0.12.8"
-rustc-demangle = "0.1.28"
+inferno = { version = "0.12.8", optional = true }
+rustc-demangle = { version = "0.1.28", optional = true }
 
 [dev-dependencies]
 caliptra-registers.workspace = true
